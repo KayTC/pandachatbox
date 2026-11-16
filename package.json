@@ -1,0 +1,23 @@
+{
+  "name": "panda-chat-box",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Panda Chat Box - giao diện chat AI",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.16.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jszip": "^3.10.2",
+    "mammoth": "^1.13.0",
+    "multer": "^2.5.0",
+    "pdf-parse": "^2.4.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  }
+}
