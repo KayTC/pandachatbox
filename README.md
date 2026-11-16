@@ -95,6 +95,74 @@ public/app.js       # Logic chat, markdown, tệp đính kèm, lịch sử
 .env                # Thông tin nhà cung cấp (không commit)
 ```
 
+## Đăng nhập và đồng bộ lịch sử
+
+Chỉ có đăng nhập, **không có chức năng tạo tài khoản**. Tài khoản cố định:
+
+| Tài khoản | Mật khẩu |
+| --- | --- |
+| `admin` | `admin123` |
+| `panda` | `140905` |
+
+Đổi danh sách tài khoản bằng biến môi trường `AUTH_USERS` (JSON), ví dụ:
+
+```ini
+AUTH_USERS=[{"username":"admin","password":"matkhau-moi","name":"Admin"},{"username":"panda","password":"matkhau-khac","name":"Panda"}]
+```
+
+Nếu không đặt, hệ thống dùng 2 tài khoản mặc định ở trên. Mật khẩu được băm bằng scrypt trong bộ nhớ, không lưu plaintext.
+
+Lịch sử chat lưu dạng key-value, không cần database:
+
+- **Local (mặc định)**: file `data/store.json`, phù hợp chạy trên máy.
+- **Online miễn phí**: Upstash Redis REST (free 10.000 lệnh/ngày, 256MB). Tạo Redis tại https://console.upstash.com rồi đặt `UPSTASH_REDIS_REST_URL` và `UPSTASH_REDIS_REST_TOKEN`.
+
+Khách chưa đăng nhập:
+
+- Được hỏi **3 câu miễn phí** (đổi bằng `GUEST_QUESTION_LIMIT`)
+- Thanh đếm hiện ngay trên ô nhập: "Còn 2/3 câu hỏi miễn phí"
+- Hết lượt: ô nhập khóa, nút gửi tắt, tự mở hộp đăng nhập; nếu cố nhấn Enter cũng mở hộp đăng nhập chứ không gửi
+- Bộ đếm lưu phía server theo cookie + IP (IP tối đa 20 câu/24h để tránh xóa cookie lách luật)
+- Đăng nhập xong dùng không giới hạn, thanh đếm tự ẩn
+- Đặt `REQUIRE_LOGIN=true` nếu muốn bỏ hoàn toàn quyền hỏi miễn phí
+
+Hoạt động:
+
+- Đăng nhập bằng tên tài khoản + mật khẩu; session 30 ngày; rate-limit 20 lần/10 phút
+- Lịch sử được tách riêng theo từng tài khoản (đăng xuất sẽ ẩn lịch sử của tài khoản đó)
+- Chat xong tự đẩy lên cloud (debounce ~1 giây), mở máy khác đăng nhập cùng tài khoản là thấy lịch sử
+- Đồng bộ chống ghi đè bản cũ; nếu dữ liệu quá lớn, app tự bỏ ảnh base64 khi đẩy lên (ảnh gốc vẫn còn trên máy đã tạo)
+- Đặt `REQUIRE_LOGIN=true` để bắt buộc đăng nhập mới chat được
+
+Giới hạn: 300 hội thoại/tài khoản, 8MB dữ liệu đồng bộ/tài khoản.
+
+Lưu ý: trên gói free của Render ổ đĩa là tạm thời, nên nếu **không** cấu hình Upstash thì lịch sử trên server sẽ mất sau mỗi lần deploy/restart. Lịch sử trong trình duyệt vẫn còn.
+
+## Deploy lên Render
+
+Cách nhanh nhất: dùng file `render.yaml` có sẵn (Blueprint).
+
+1. Push code lên GitHub (không commit `.env`).
+2. Render → **New** → **Blueprint** → chọn repo. Render đọc `render.yaml`.
+3. Trong tab **Environment**, nhập `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`.
+4. Deploy. Kiểm tra `https://<tên-app>.onrender.com/healthz` trả `{"ok":true}`.
+
+Hoặc tạo **Web Service** thủ công:
+
+- Runtime: Node
+- Build Command: `npm install`
+- Start Command: `npm start`
+- Health Check Path: `/healthz`
+- Node version: lấy từ `.nvmrc` (22), hoặc đặt biến `NODE_VERSION=22`
+
+Lưu ý khi chạy trên Render:
+
+- Không cần đặt `PORT` hay `HOST`; Render tự cấp `PORT` và server bind `0.0.0.0` khi phát hiện môi trường cloud/production.
+- Biến môi trường đặt trong dashboard Render, **không** dùng file `.env`.
+- Gói Free sẽ "ngủ" sau ~15 phút không truy cập; request đầu tiên sau đó chậm vài chục giây.
+- Ổ đĩa trên Render là tạm thời: lịch sử chat lưu ở trình duyệt người dùng nên không mất, nhưng không có gì ghi trên server để giữ.
+- Nếu build lỗi ở bước `npm install` với gói `xlsx` (tải từ cdn.sheetjs.com), kiểm tra Render có truy cập được host đó; hoặc đổi sang gói npm tương đương nếu cần.
+
 ## Ghi chú
 
 - Lịch sử chat lưu trên máy người dùng, xóa bằng nút thùng rác ở sidebar.

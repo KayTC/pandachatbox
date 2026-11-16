@@ -8,6 +8,9 @@ const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const JSZip = require('jszip');
 const { PDFParse } = require('pdf-parse');
+const store = require('./lib/store');
+const auth = require('./lib/auth');
+const guest = require('./lib/guest');
 
 const ENV_PATH = path.join(__dirname, '.env');
 const PROMPT_PATH = path.join(__dirname, 'prompts', 'system.md');
@@ -16,7 +19,10 @@ dotenv.config({ path: ENV_PATH });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '127.0.0.1';
+const IS_CLOUD =
+  Boolean(process.env.RENDER || process.env.RAILWAY_ENVIRONMENT || process.env.FLY_APP_NAME) ||
+  process.env.NODE_ENV === 'production';
+const HOST = process.env.HOST || (IS_CLOUD ? '0.0.0.0' : '127.0.0.1');
 
 const DEFAULT_SYSTEM_PROMPT =
   'Bạn là Panda, trợ lý AI thân thiện, trả lời ngắn gọn, chính xác bằng ngôn ngữ của người dùng.';
@@ -476,14 +482,176 @@ function optimizeMessages(messages) {
 app.use(express.json({ limit: '45mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true });
+});
+
 app.get('/api/config', (req, res) => {
   const cfg = getConfig();
-  res.json({ configured: cfg.configured });
+  res.json({ configured: cfg.configured, auth: true, storage: store.driver });
+});
+
+/* ---------------- Auth & sync ---------------- */
+
+const authAttempts = new Map();
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_MAX_ATTEMPTS = 20;
+
+function authRateLimit(req, res, next) {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+  const entry = authAttempts.get(ip) || { count: 0, resetAt: now + AUTH_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + AUTH_WINDOW_MS;
+  }
+  entry.count += 1;
+  authAttempts.set(ip, entry);
+  if (entry.count > AUTH_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: 'Quá nhiều lần thử. Vui lòng đợi vài phút.' });
+  }
+  next();
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of authAttempts) {
+    if (now > entry.resetAt) authAttempts.delete(ip);
+  }
+}, 5 * 60 * 1000).unref?.();
+
+app.post('/api/auth/register', (req, res) => {
+  res.status(403).json({ error: 'Hệ thống chỉ cho phép đăng nhập bằng tài khoản có sẵn.' });
+});
+
+app.post('/api/auth/login', authRateLimit, async (req, res) => {
+  try {
+    const { username, email, password } = req.body || {};
+    const user = auth.verifyCredentials({ username, email, password });
+    const token = await auth.createSession(user.id);
+    res.json({ token, user: auth.publicUser(user) });
+  } catch (err) {
+    res.status(401).json({ error: err.message || 'Đăng nhập thất bại.' });
+  }
+});
+
+app.get('/api/auth/me', auth.authenticate, (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  await auth.destroySession(token).catch(() => {});
+  res.json({ ok: true });
+});
+
+const MAX_CONVERSATIONS = 300;
+const MAX_CONVERSATION_BYTES = 1200000;
+const MAX_SYNC_BYTES = 8 * 1024 * 1024;
+
+app.get('/api/conversations', auth.authenticate, async (req, res) => {
+  try {
+    const data = (await store.getJson(`conv:${req.user.id}`)) || { conversations: [], updatedAt: 0 };
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: `Không đọc được dữ liệu: ${err.message}` });
+  }
+});
+
+app.put('/api/conversations', auth.authenticate, async (req, res) => {
+  try {
+    const { conversations, updatedAt } = req.body || {};
+    if (!Array.isArray(conversations)) {
+      return res.status(400).json({ error: 'Dữ liệu không hợp lệ.' });
+    }
+    if (conversations.length > MAX_CONVERSATIONS) {
+      return res.status(400).json({ error: `Tối đa ${MAX_CONVERSATIONS} cuộc trò chuyện.` });
+    }
+
+    const current = await store.getJson(`conv:${req.user.id}`);
+    const currentUpdatedAt = current?.updatedAt || 0;
+    if (currentUpdatedAt && typeof updatedAt === 'number' && updatedAt < currentUpdatedAt) {
+      return res.json({ ok: true, skipped: true, conversations: current.conversations, updatedAt: currentUpdatedAt });
+    }
+
+    const clean = conversations
+      .filter((c) => c && typeof c.id === 'string' && Array.isArray(c.messages))
+      .map((c) => ({
+        id: c.id,
+        title: typeof c.title === 'string' ? c.title.slice(0, 200) : 'Cuộc trò chuyện',
+        createdAt: Number(c.createdAt) || Date.now(),
+        updatedAt: Number(c.updatedAt) || Date.now(),
+        messages: c.messages.slice(-200).map((m) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: typeof m.content === 'string' ? m.content : '',
+          ts: Number(m.ts) || Date.now(),
+          attachments: Array.isArray(m.attachments)
+            ? m.attachments.slice(0, 8).map((a) => ({
+                id: a.id,
+                name: a.name,
+                size: a.size,
+                mime: a.mime,
+                kind: a.kind,
+                text: typeof a.text === 'string' ? a.text : undefined,
+                dataUrl: typeof a.dataUrl === 'string' ? a.dataUrl : undefined,
+                truncated: Boolean(a.truncated),
+              }))
+            : undefined,
+        })),
+      }));
+
+    const payload = { conversations: clean, updatedAt: Date.now() };
+    const size = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+    if (size > MAX_SYNC_BYTES) {
+      return res.status(413).json({
+        error: 'Dữ liệu quá lớn để đồng bộ. Hãy xóa bớt hội thoại hoặc ảnh/tệp cũ.',
+      });
+    }
+
+    const perConversation = clean.find((c) => Buffer.byteLength(JSON.stringify(c), 'utf8') > MAX_CONVERSATION_BYTES);
+    if (perConversation) {
+      return res.status(413).json({
+        error: `Cuộc trò chuyện "${perConversation.title}" quá lớn để đồng bộ.`,
+      });
+    }
+
+    await store.setJson(`conv:${req.user.id}`, payload);
+    res.json({ ok: true, updatedAt: payload.updatedAt });
+  } catch (err) {
+    res.status(500).json({ error: `Không lưu được dữ liệu: ${err.message}` });
+  }
+});
+
+const REQUIRE_LOGIN = String(process.env.REQUIRE_LOGIN || '').toLowerCase() === 'true';
+
+async function optionalUser(req) {
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+  return auth.userFromToken(token).catch(() => null);
+}
+
+app.get('/api/guest-status', async (req, res) => {
+  try {
+    const data = await guest.status(req, res);
+    res.json({ ...data, requireLogin: REQUIRE_LOGIN });
+  } catch {
+    res.json({ limit: guest.LIMIT, used: 0, remaining: guest.LIMIT, allowed: true, requireLogin: REQUIRE_LOGIN });
+  }
 });
 
 app.post('/api/chat', async (req, res) => {
   const cfg = getConfig();
   const { messages } = req.body || {};
+  const user = await optionalUser(req);
+
+  if (REQUIRE_LOGIN && !user) {
+    return res.status(401).json({
+      error: 'Vui lòng đăng nhập để trò chuyện.',
+      code: 'LOGIN_REQUIRED',
+    });
+  }
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'Thiếu nội dung tin nhắn.' });
@@ -503,6 +671,25 @@ app.post('/api/chat', async (req, res) => {
 
   if (!cleanMessages.length) {
     return res.status(400).json({ error: 'Nội dung tin nhắn không hợp lệ.' });
+  }
+
+  if (!user) {
+    const quota = await guest.consume(req, res).catch(() => ({ ok: true, limit: guest.LIMIT, remaining: 1 }));
+    if (!quota.ok) {
+      const message =
+        quota.reason === 'ip'
+          ? 'Thiết bị/mạng này đã dùng quá nhiều câu hỏi miễn phí. Đăng nhập để tiếp tục.'
+          : `Bạn đã dùng hết ${quota.limit} câu hỏi miễn phí. Đăng nhập để tiếp tục trò chuyện.`;
+      return res.status(401).json({
+        error: message,
+        code: 'GUEST_LIMIT',
+        limit: quota.limit,
+        used: quota.used,
+        remaining: 0,
+      });
+    }
+    res.setHeader('X-Guest-Remaining', String(quota.remaining));
+    res.setHeader('X-Guest-Limit', String(quota.limit));
   }
 
   const optimizedMessages = optimizeMessages(cleanMessages);
@@ -598,6 +785,9 @@ app.post('/api/chat', async (req, res) => {
 });
 
 app.get('*', (req, res) => {
+  if (req.path.startsWith('/api/') || req.path === '/healthz') {
+    return res.status(404).json({ error: 'Không tìm thấy endpoint.' });
+  }
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
@@ -627,7 +817,7 @@ try {
 
 app.listen(PORT, HOST, () => {
   const cfg = getConfig();
-  console.log(`\n  Panda Chat Box đang chạy tại http://localhost:${PORT}\n`);
+  console.log(`\n  Panda Chat Box đang chạy tại http://${HOST}:${PORT}\n`);
   if (!cfg.configured) {
     console.log('  ⚠ Chưa cấu hình .env (AI_BASE_URL / AI_API_KEY / AI_MODEL)\n');
   } else {

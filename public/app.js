@@ -4,6 +4,22 @@
   const STORAGE_KEY = 'panda.chats.v1';
   const THEME_KEY = 'panda.theme';
   const CURRENT_KEY = 'panda.currentId';
+  const TOKEN_KEY = 'panda.token';
+  const USER_KEY = 'panda.user';
+  const SYNC_UPDATED_KEY = 'panda.syncUpdatedAt';
+
+  function scopeSuffix() {
+    return state.user?.id ? `:${state.user.id}` : '';
+  }
+  function chatsKey() {
+    return `${STORAGE_KEY}${scopeSuffix()}`;
+  }
+  function currentIdKey() {
+    return `${CURRENT_KEY}${scopeSuffix()}`;
+  }
+  function syncUpdatedKey() {
+    return `${SYNC_UPDATED_KEY}${scopeSuffix()}`;
+  }
 
   const $ = (sel) => document.querySelector(sel);
   const els = {
@@ -37,6 +53,23 @@
     sendBtn: $('#sendBtn'),
     stopBtn: $('#stopBtn'),
     toast: $('#toast'),
+    accountBtn: $('#accountBtn'),
+    accountAvatar: $('#accountAvatar'),
+    accountName: $('#accountName'),
+    accountSub: $('#accountSub'),
+    syncDot: $('#syncDot'),
+    authModal: $('#authModal'),
+    authClose: $('#authClose'),
+    authForm: $('#authForm'),
+    authEmail: $('#authEmail'),
+    authPassword: $('#authPassword'),
+    authError: $('#authError'),
+    authSubmit: $('#authSubmit'),
+    authTitle: $('#authTitle'),
+    authDesc: $('#authDesc'),
+    guestBar: $('#guestBar'),
+    guestText: $('#guestText'),
+    guestLogin: $('#guestLogin'),
   };
 
   const state = {
@@ -47,6 +80,11 @@
     stickToBottom: true,
     pendingAttachments: [],
     quotaWarned: false,
+    token: null,
+    user: null,
+    syncTimer: null,
+    syncState: 'off',
+    guest: { limit: 3, used: 0, remaining: 3, allowed: true, requireLogin: false },
   };
 
   const MAX_ATTACHMENTS = 6;
@@ -92,30 +130,397 @@
 
   /* ---------------- Storage ---------------- */
 
-  function loadConversations() {
+  function readChats(key) {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(key);
       const list = raw ? JSON.parse(raw) : [];
-      state.conversations = Array.isArray(list) ? list.filter((c) => c && c.id && Array.isArray(c.messages)) : [];
+      return Array.isArray(list) ? list.filter((c) => c && c.id && Array.isArray(c.messages)) : [];
     } catch {
-      state.conversations = [];
+      return [];
     }
-    state.currentId = localStorage.getItem(CURRENT_KEY);
+  }
+
+  function loadConversations() {
+    state.conversations = readChats(chatsKey());
+    state.currentId = localStorage.getItem(currentIdKey());
     if (!state.conversations.some((c) => c.id === state.currentId)) {
       state.currentId = state.conversations[0]?.id || null;
     }
   }
 
-  function saveConversations() {
+  function adoptGuestChats(userId) {
+    if (!userId) return;
+    const userKey = `${STORAGE_KEY}:${userId}`;
+    if (localStorage.getItem(userKey)) return;
+    const guest = readChats(STORAGE_KEY);
+    if (!guest.length) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.conversations));
-      if (state.currentId) localStorage.setItem(CURRENT_KEY, state.currentId);
-      else localStorage.removeItem(CURRENT_KEY);
+      localStorage.setItem(userKey, JSON.stringify(guest));
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(CURRENT_KEY);
+    } catch {}
+  }
+
+  function saveConversations() {
+    saveLocalOnly();
+    queueSync();
+  }
+
+  /* ---------------- Account & sync ---------------- */
+
+  function apiFetch(path, options = {}) {
+    const headers = { ...(options.headers || {}) };
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    return fetch(path, { ...options, headers });
+  }
+
+  function initials(user) {
+    const source = user?.name || user?.username || user?.email || '?';
+    return source.trim().charAt(0).toUpperCase();
+  }
+
+  function userLabel(user) {
+    return user?.name || user?.username || user?.email || '';
+  }
+
+  function userSubLabel(user) {
+    if (!user) return '';
+    if (user.username) return `@${user.username}`;
+    return user.email || '';
+  }
+
+  function renderAccount() {
+    const user = state.user;
+    if (user) {
+      els.accountAvatar.innerHTML = '';
+      els.accountAvatar.textContent = initials(user);
+      els.accountName.textContent = userLabel(user);
+      els.accountSub.textContent = userSubLabel(user);
+      els.accountBtn.title = 'Đã đăng nhập · Nhấn để đăng xuất';
+    } else {
+      els.accountAvatar.innerHTML =
+        '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"><circle cx="12" cy="9" r="3.6" stroke="currentColor" stroke-width="1.8"/><path d="M4.8 20c1-3.4 3.7-5.2 7.2-5.2s6.2 1.8 7.2 5.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+      els.accountName.textContent = 'Đăng nhập';
+      els.accountSub.textContent = 'Đồng bộ lịch sử';
+      els.accountBtn.title = 'Đăng nhập để đồng bộ lịch sử';
+    }
+    renderSyncState();
+  }
+
+  function renderGuest() {
+    if (state.user || state.token) {
+      els.guestBar.hidden = true;
+      return;
+    }
+    const { limit, remaining, allowed, requireLogin } = state.guest;
+    els.guestBar.hidden = false;
+    if (requireLogin) {
+      els.guestBar.classList.add('limit');
+      els.guestText.textContent = 'Cần đăng nhập để trò chuyện';
+      els.guestLogin.textContent = 'Đăng nhập';
+      return;
+    }
+    if (!allowed || remaining <= 0) {
+      els.guestBar.classList.add('limit');
+      els.guestText.textContent = `Đã hết ${limit} câu hỏi miễn phí`;
+      els.guestLogin.textContent = 'Đăng nhập để tiếp tục';
+    } else {
+      els.guestBar.classList.remove('limit');
+      els.guestText.textContent = `Còn ${remaining}/${limit} câu hỏi miễn phí`;
+      els.guestLogin.textContent = 'Đăng nhập';
+    }
+  }
+
+  async function loadGuestStatus() {
+    if (state.user) return;
+    try {
+      const response = await fetch('/api/guest-status');
+      if (!response.ok) return;
+      const data = await response.json();
+      state.guest = {
+        limit: Number(data.limit) || 3,
+        used: Number(data.used) || 0,
+        remaining: Number(data.remaining) || 0,
+        allowed: Boolean(data.allowed),
+        requireLogin: Boolean(data.requireLogin),
+      };
+      renderGuest();
+      updateComposer();
+    } catch {}
+  }
+
+  function renderSyncState() {
+    const map = {
+      off: ['sync-dot off', 'Chưa đăng nhập'],
+      idle: ['sync-dot ok', 'Đã đồng bộ'],
+      syncing: ['sync-dot syncing', 'Đang đồng bộ…'],
+      error: ['sync-dot error', 'Đồng bộ lỗi'],
+    };
+    const [cls, label] = map[state.syncState] || map.off;
+    els.syncDot.className = cls;
+    els.syncDot.title = label;
+  }
+
+  function setSyncState(next) {
+    state.syncState = next;
+    renderSyncState();
+  }
+
+  function queueSync() {
+    if (!state.token) return;
+    setSyncState('syncing');
+    clearTimeout(state.syncTimer);
+    state.syncTimer = setTimeout(pushConversations, 900);
+  }
+
+  function slimConversations(dropImages) {
+    return state.conversations.map((convo) => ({
+      ...convo,
+      messages: convo.messages.map((m) => {
+        if (!Array.isArray(m.attachments) || !m.attachments.length) return m;
+        return {
+          ...m,
+          attachments: m.attachments.map((a) =>
+            dropImages && a.dataUrl ? { ...a, dataUrl: undefined } : a
+          ),
+        };
+      }),
+    }));
+  }
+
+  async function putConversations(conversations) {
+    return apiFetch('/api/conversations', {
+      method: 'PUT',
+      body: JSON.stringify({ conversations, updatedAt: Date.now() }),
+    });
+  }
+
+  async function pushConversations() {
+    if (!state.token) return;
+    try {
+      let response = await putConversations(state.conversations);
+      if (response.status === 401) {
+        signOut(true);
+        return;
+      }
+      if (response.status === 413) {
+        response = await putConversations(slimConversations(true));
+        if (response.ok) {
+          setSyncState('idle');
+          els.syncDot.title = 'Đã đồng bộ (ảnh đính kèm chỉ lưu trên máy này)';
+          return;
+        }
+      }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Lỗi ${response.status}`);
+      if (!data.skipped) {
+        localStorage.setItem(syncUpdatedKey(), String(data.updatedAt || Date.now()));
+      }
+      setSyncState('idle');
+    } catch (err) {
+      setSyncState('error');
+      els.syncDot.title = err.message || 'Đồng bộ lỗi';
+    }
+  }
+
+  async function pullConversations() {
+    if (!state.token) return false;
+    try {
+      const response = await apiFetch('/api/conversations');
+      if (response.status === 401) {
+        signOut(true);
+        return false;
+      }
+      if (!response.ok) throw new Error(`Lỗi ${response.status}`);
+      const data = await response.json();
+      const remote = Array.isArray(data.conversations) ? data.conversations : [];
+      const remoteUpdatedAt = Number(data.updatedAt) || 0;
+      const localUpdatedAt = Number(localStorage.getItem(syncUpdatedKey()) || 0);
+
+      if (!remote.length) {
+        if (state.conversations.length) await pushConversations();
+        return false;
+      }
+      if (remoteUpdatedAt <= localUpdatedAt && state.conversations.length) {
+        return false;
+      }
+
+      state.conversations = remote
+        .filter((c) => c && c.id && Array.isArray(c.messages))
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      if (!state.conversations.some((c) => c.id === state.currentId)) {
+        state.currentId = state.conversations[0]?.id || null;
+      }
+      localStorage.setItem(syncUpdatedKey(), String(remoteUpdatedAt));
+      saveLocalOnly();
+      renderChatList();
+      renderMessages();
+      updateTopbar();
+      setSyncState('idle');
+      return true;
+    } catch {
+      setSyncState('error');
+      return false;
+    }
+  }
+
+  function saveLocalOnly() {
+    try {
+      localStorage.setItem(chatsKey(), JSON.stringify(state.conversations));
+      if (state.currentId) localStorage.setItem(currentIdKey(), state.currentId);
+      else localStorage.removeItem(currentIdKey());
     } catch {
       if (!state.quotaWarned) {
         state.quotaWarned = true;
         toast('Bộ nhớ trình duyệt đã đầy, ảnh/tệp cũ có thể không được lưu lại.');
       }
+    }
+  }
+
+  function openAuth() {
+    els.authError.hidden = true;
+    els.authError.textContent = '';
+    els.authModal.classList.add('show');
+    setTimeout(() => els.authEmail.focus(), 80);
+  }
+
+  function closeAuth() {
+    els.authModal.classList.remove('show');
+  }
+
+  async function submitAuth(e) {
+    e.preventDefault();
+    const username = els.authEmail.value.trim();
+    const password = els.authPassword.value;
+
+    els.authError.hidden = true;
+    els.authSubmit.disabled = true;
+    els.authSubmit.textContent = 'Đang đăng nhập…';
+
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Lỗi ${response.status}`);
+
+      adoptGuestChats(data.user?.id);
+      state.token = data.token;
+      state.user = data.user;
+      loadConversations();
+      localStorage.setItem(TOKEN_KEY, data.token);
+      localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      renderAccount();
+      renderGuest();
+      renderChatList();
+      renderMessages();
+      updateTopbar();
+      els.authForm.reset();
+      closeAuth();
+      updateComposer();
+      toast(`Xin chào ${userLabel(data.user)}`);
+
+      const merged = await mergeAfterLogin();
+      if (merged) toast('Đã tải lịch sử từ tài khoản');
+      else await pushConversations();
+    } catch (err) {
+      els.authError.textContent = err.message || 'Không đăng nhập được.';
+      els.authError.hidden = false;
+    } finally {
+      els.authSubmit.disabled = false;
+      els.authSubmit.textContent = 'Đăng nhập';
+    }
+  }
+
+  async function mergeAfterLogin() {
+    try {
+      const response = await apiFetch('/api/conversations');
+      if (!response.ok) return false;
+      const data = await response.json();
+      const remote = Array.isArray(data.conversations) ? data.conversations : [];
+      if (!remote.length) return false;
+
+      const byId = new Map();
+      for (const convo of remote) byId.set(convo.id, convo);
+      for (const convo of state.conversations) {
+        const existing = byId.get(convo.id);
+        if (!existing || (convo.updatedAt || 0) > (existing.updatedAt || 0)) byId.set(convo.id, convo);
+      }
+
+      state.conversations = [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      if (!state.conversations.some((c) => c.id === state.currentId)) {
+        state.currentId = state.conversations[0]?.id || null;
+      }
+      saveLocalOnly();
+      renderChatList();
+      renderMessages();
+      updateTopbar();
+      setSyncState('idle');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function signOut(silent = false) {
+    if (state.token) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${state.token}` },
+        });
+      } catch {}
+    }
+    state.token = null;
+    state.user = null;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    loadConversations();
+    renderChatList();
+    renderMessages();
+    updateTopbar();
+    setSyncState('off');
+    renderAccount();
+    loadGuestStatus();
+    if (!silent) toast('Đã đăng xuất. Lịch sử vẫn còn trên máy này.');
+  }
+
+  async function restoreSession() {
+    const token = localStorage.getItem(TOKEN_KEY);
+    const cachedUser = localStorage.getItem(USER_KEY);
+    if (cachedUser) {
+      try {
+        state.user = JSON.parse(cachedUser);
+      } catch {}
+    }
+    if (!token) {
+      renderAccount();
+      return;
+    }
+    state.token = token;
+    loadConversations();
+    renderChatList();
+    renderMessages();
+    updateTopbar();
+    renderAccount();
+    setSyncState('syncing');
+    try {
+      const response = await apiFetch('/api/auth/me');
+      if (!response.ok) {
+        await signOut(true);
+        return;
+      }
+      const data = await response.json();
+      state.user = data.user;
+      localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      renderAccount();
+      const pulled = await pullConversations();
+      if (!pulled) setSyncState('idle');
+    } catch {
+      setSyncState('error');
     }
   }
 
@@ -830,14 +1235,25 @@
 
   /* ---------------- Streaming ---------------- */
 
+  function guestBlocked() {
+    if (state.user) return false;
+    return state.guest.requireLogin === true || state.guest.allowed === false;
+  }
+
   function updateComposer() {
     const hasText = els.input.value.trim().length > 0;
     const hasReadyFiles = state.pendingAttachments.some((a) => a.status === 'ready');
     const uploading = state.pendingAttachments.some((a) => a.status === 'uploading');
+    const blocked = guestBlocked();
     els.sendBtn.hidden = state.streaming;
-    els.sendBtn.disabled = (!hasText && !hasReadyFiles) || uploading;
+    els.sendBtn.disabled = (!hasText && !hasReadyFiles) || uploading || blocked || Boolean(state.streaming);
     els.stopBtn.hidden = !state.streaming;
     els.input.disabled = false;
+    els.input.placeholder = blocked
+      ? state.guest.requireLogin
+        ? 'Đăng nhập để trò chuyện'
+        : 'Hết câu hỏi miễn phí — đăng nhập để tiếp tục'
+      : 'Nhắn tin cho Panda...';
   }
 
   function stopGeneration(silent = false) {
@@ -941,20 +1357,45 @@
     };
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await apiFetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: history }),
         signal: controller.signal,
       });
 
       if (!response.ok) {
         let message = `Lỗi ${response.status}`;
+        let code = '';
         try {
           const data = await response.json();
           if (data && data.error) message = data.error;
+          if (data && data.code) code = data.code;
         } catch {}
+
+        if (code === 'GUEST_LIMIT') {
+          state.guest.allowed = false;
+          state.guest.remaining = 0;
+          renderGuest();
+          updateComposer();
+          openAuth();
+        } else if (code === 'LOGIN_REQUIRED' || response.status === 401) {
+          openAuth();
+        }
         throw new Error(message);
+      }
+
+      if (!state.user) {
+        const remainingHeader = response.headers.get('X-Guest-Remaining');
+        if (remainingHeader != null && remainingHeader !== '') {
+          const remaining = Number(remainingHeader);
+          if (Number.isFinite(remaining)) {
+            state.guest.remaining = Math.max(0, remaining);
+            state.guest.allowed = remaining > 0;
+            state.guest.used = Math.max(state.guest.used, state.guest.limit - state.guest.remaining);
+            renderGuest();
+            updateComposer();
+          }
+        }
       }
 
       const reader = response.body.getReader();
@@ -1029,8 +1470,10 @@
     } finally {
       state.streaming = false;
       state.abortController = null;
+      state.stickToBottom = true;
       updateComposer();
       if (state.stickToBottom) scrollToBottom();
+      if (!state.user && state.token === null) loadGuestStatus();
     }
   }
 
@@ -1083,6 +1526,10 @@
 
   function sendMessage(text) {
     if (state.streaming) return;
+    if (guestBlocked()) {
+      openAuth();
+      return;
+    }
     const content = (text || '').trim();
     const readyFiles = state.pendingAttachments.filter((a) => a.status === 'ready');
 
@@ -1224,6 +1671,22 @@
 
     els.lightbox.addEventListener('click', closeLightbox);
 
+    els.guestLogin.addEventListener('click', () => openAuth());
+
+    els.accountBtn.addEventListener('click', () => {
+      if (state.user) {
+        if (window.confirm(`Đăng xuất khỏi ${userLabel(state.user)}?`)) signOut(false);
+      } else {
+        openAuth();
+      }
+    });
+
+    els.authClose.addEventListener('click', closeAuth);
+    els.authModal.addEventListener('click', (e) => {
+      if (e.target === els.authModal) closeAuth();
+    });
+    els.authForm.addEventListener('submit', submitAuth);
+
     els.suggestions.addEventListener('click', (e) => {
       const btn = e.target.closest('.suggestion');
       if (!btn) return;
@@ -1264,8 +1727,19 @@
         newChat();
       }
       if (e.key === 'Escape') {
+        closeAuth();
         closeLightbox();
         closeSidebar();
+      }
+    });
+
+    window.addEventListener('online', () => {
+      if (state.token && state.syncState === 'error') queueSync();
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.token && state.syncState === 'error') {
+        queueSync();
       }
     });
 
@@ -1392,7 +1866,9 @@
     renderMessages();
     updateTopbar();
     updateComposer();
+    restoreSession();
     loadConfig();
+    loadGuestStatus();
     setInterval(loadConfig, 10000);
     initPandaTrail();
     autoResize();
